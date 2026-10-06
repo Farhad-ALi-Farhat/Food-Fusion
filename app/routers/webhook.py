@@ -237,6 +237,7 @@ def _notify_admins_of_order(db: Session, customer: User, order_id: int) -> None:
 
 def send_order_confirmation_template(to_number: str, order: Order, items_summary: str) -> None:
     to_number = normalize_whatsapp_number(to_number)
+    customer_display_number = "+" + order.customer.whatsapp_number
     url = f"https://graph.facebook.com/v20.0/{settings.whatsapp_phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {settings.whatsapp_token}"}
     payload = {
@@ -253,6 +254,7 @@ def send_order_confirmation_template(to_number: str, order: Order, items_summary
                         {"type": "text", "text": str(order.id)},
                         {"type": "text", "text": items_summary},
                         {"type": "text", "text": f"{float(order.total):.0f}"},
+                        {"type": "text", "text": customer_display_number},
                     ],
                 },
                 {
