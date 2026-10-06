@@ -55,7 +55,7 @@ securely in a managed database.</p>
 contact us to request deletion of your data.</p>
 
 <h2>Contact</h2>
-<p>For questions about this policy, contact us at [your email or phone number here].</p>
+<p>For questions about this policy, contact us at farhadalifarhat@gmail.com.</p>
 </body>
 </html>
 """
