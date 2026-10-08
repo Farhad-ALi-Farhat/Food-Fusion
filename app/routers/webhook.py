@@ -49,7 +49,9 @@ def verify_webhook(
 
 @router.post("/webhook")
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
+    logger.info("=== WEBHOOK HIT ===")
     raw_body = await request.body()
+    logger.info("RAW PAYLOAD: %s", raw_body.decode("utf-8"))
     signature = request.headers.get("X-Hub-Signature-256")
     if not verify_signature(raw_body, signature, settings.whatsapp_app_secret):
         logger.warning("Rejected webhook POST with invalid signature")
