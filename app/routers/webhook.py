@@ -12,6 +12,7 @@ import logging
 
 import hmac, hashlib
 import httpx
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, BackgroundTasks, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session, joinedload
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import normalize_whatsapp_number, settings
 from app.conversation import already_processed, append_turn, load_history
 from app.database import SessionLocal
-from app.models import Order, OrderItem, OrderStatus, User, UserRole
+from app.models import ConversationMessage, MessageRole, Order, OrderItem, OrderStatus, User, UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,7 @@ def verify_webhook(
 
 @router.post("/webhook")
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
-    logger.info("=== WEBHOOK HIT ===")
     raw_body = await request.body()
-    logger.info("RAW PAYLOAD: %s", raw_body.decode("utf-8"))
     signature = request.headers.get("X-Hub-Signature-256")
     if not verify_signature(raw_body, signature, settings.whatsapp_app_secret):
         logger.warning("Rejected webhook POST with invalid signature")
@@ -77,6 +76,49 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(_process_inbound, inbound)
     return {"status": "ok"}
 
+def _admin_window_open(db: Session, admin_number: str) -> bool:
+    admin = db.query(User).filter(User.whatsapp_number == normalize_whatsapp_number(admin_number)).first()
+    if admin is None:
+        return False
+    last = (
+        db.query(ConversationMessage.created_at)
+        .filter(ConversationMessage.user_id == admin.id, ConversationMessage.role == MessageRole.user)
+        .order_by(ConversationMessage.created_at.desc())
+        .first()
+    )
+    return last is not None and datetime.now(timezone.utc) - last[0] < timedelta(hours=23)
+
+
+def send_order_interactive(to_number: str, order: Order, items_summary: str) -> None:
+    to_number = normalize_whatsapp_number(to_number)
+    body = (
+        f"New order #{order.id} — {items_summary}\n"
+        f"Total: Rs. {float(order.total):.0f}\n"
+        f"Customer: +{order.customer.whatsapp_number}"
+    )[:1000]
+    url = f"https://graph.facebook.com/v20.0/{settings.whatsapp_phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {settings.whatsapp_token}"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_number,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {"buttons": [
+                {"type": "reply", "reply": {"id": f"APPROVE_{order.id}", "title": "Approve"}},
+                {"type": "reply", "reply": {"id": f"DECLINE_{order.id}", "title": "Decline"}},
+            ]},
+        },
+    }
+    try:
+        response = httpx.post(url, headers=headers, json=payload, timeout=15)
+        if response.status_code >= 400:
+            logger.error("Interactive send failed to=%s status=%s body=%s", to_number, response.status_code, response.text)
+        else:
+            logger.info("Interactive send ok to=%s status=%s", to_number, response.status_code)
+    except httpx.HTTPError:
+        logger.exception("Interactive send HTTP error to=%s", to_number)
 
 def _extract_inbound(payload: dict) -> dict | None:
     """Parse Meta payload. None for status callbacks / unusable body."""
@@ -92,6 +134,10 @@ def _extract_inbound(payload: dict) -> dict | None:
             return {"kind": "text", "sender": sender, "text": msg["text"]["body"], "wa_message_id": wa_message_id}
         if msg.get("type") == "button":
             return {"kind": "button", "sender": sender, "payload": msg["button"]["payload"], "wa_message_id": wa_message_id}
+        if msg.get("type") == "interactive":
+            reply = msg["interactive"].get("button_reply")
+            if reply:
+                return {"kind": "button", "sender": sender, "payload": reply["id"], "wa_message_id": wa_message_id}
         return {"kind": "non_text", "sender": sender, "text": None, "wa_message_id": wa_message_id}
     except (KeyError, IndexError, TypeError):
         return None
@@ -209,17 +255,6 @@ def _pending_order_ids(db: Session, customer_id: int) -> set[int]:
     )
     return {row[0] for row in rows}
 
-
-def format_staff_order_notice(order: Order, customer: User) -> str:
-    lines = [f"New order #{order.id} from {customer.whatsapp_number}"]
-    for line in order.items:
-        name = line.menu_item.name if line.menu_item is not None else f"item {line.menu_item_id}"
-        lines.append(f"- {line.quantity}x {name} — Rs. {float(line.subtotal):.0f}")
-    lines.append(f"Total: Rs. {float(order.total):.0f}")
-    lines.append("Status: pending confirmation")
-    return "\n".join(lines)
-
-
 def _notify_admins_of_order(db: Session, customer: User, order_id: int) -> None:
     order = (
         db.query(Order)
@@ -234,7 +269,10 @@ def _notify_admins_of_order(db: Session, customer: User, order_id: int) -> None:
         for l in order.items
     )
     for admin_number in settings.admin_number_set:
-        send_order_confirmation_template(admin_number, order, items_summary)
+        if _admin_window_open(db, admin_number):
+            send_order_interactive(admin_number, order, items_summary)
+        else:
+            send_order_confirmation_template(admin_number, order, items_summary)
 
 
 def send_order_confirmation_template(to_number: str, order: Order, items_summary: str) -> None:
