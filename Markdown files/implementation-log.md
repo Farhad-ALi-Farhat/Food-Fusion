@@ -4,298 +4,379 @@ Chronological record of what's been built, broken, fixed, and tested since the d
 (`project-spec.md`, `db-schema.md`, `agent-prompts.md`, `food-fusion-menu.md`) were finalized.
 Read this alongside those four — this file covers *implementation reality*, not design decisions.
 
-**Status as of this update:** the full webhook → agent → DB → WhatsApp loop is live and has been
-manually tested end-to-end, including the customer ordering flow, admin menu management, and a
-model-resilience fallback. Still open: a full soak test of submit → admin confirm → customer
-notification, and a decision on hardening the duplicate-delivery race window.
+**Status as of this update (2026-10-08):** Food Fusion is **deployed on Azure App Service and live on a
+real, dedicated WhatsApp Business number**, and the full loop has been tested end to end on that
+setup: customer orders (English and Roman Urdu) → order submitted → admin receives Approve/Decline
+buttons → admin approves → customer receives the confirmation. Primary LLM is `openai/gpt-oss-20b`
+on Groq for both agents, with Gemini (`gemini-3.5-flash-lite`) as fallback. The Azure and Meta
+go-live story (including every quota, auth and billing obstacle) is in `deployment-notes.md`; this
+file covers the application-level changes made around it.
 
 ---
 
 ## 1. Environment (as currently set up)
 
-- **Dev machine**: Windows, VS Code, Python 3.13
-- **Database**: Supabase Postgres — connection string in `.env` as `DATABASE_URL`
-- **LLM — see §6, this changed significantly.** Current: Groq (`openai/gpt-oss-20b`) as primary,
-  Gemini (`gemini-3.5-flash-lite`) as fallback, via a `ModelFallbackMiddleware`.
-- **WhatsApp**: Meta Cloud API. Moved off the short-lived temporary access token (which expired
-  unpredictably, sometimes in under an hour) to a **permanent Business System User token** —
-  see §7. `WHATSAPP_APP_SECRET` added for webhook signature verification — see §5.
-- **`WHATSAPP_VERIFY_TOKEN`**: unchanged from original setup.
-- **Project scaffold**: user now edits files directly on their machine; changes delivered as
-  diffs/full-file content in chat, not zipped.
-- Menu seeded (all items from `food-fusion-menu.md`), later corrected for the Boti spelling —
-  see §4.
+- **Hosting**: Azure App Service (Linux, B1, Central US), `food-fusion-bot.azurewebsites.net`;
+  deploys automatically from GitHub on push to `main` via GitHub Actions. Secrets live in App
+  Service application settings, not a `.env` file. See `deployment-notes.md`.
+- **Dev machine**: Windows, VS Code, Python 3.13 (local dev only now; production is Azure Linux).
+- **Database**: Supabase Postgres via `pg8000` (not `psycopg2`) — see §9.
+- **LLM**: Groq (`openai/gpt-oss-20b`) primary for both agents, Gemini (`gemini-3.5-flash-lite`)
+  fallback via `ModelFallbackMiddleware`. Full history of how this was arrived at is in §6
+  (original log) and §8 — don't change without reading both.
+- **WhatsApp**: Meta app in **Live mode**; a dedicated number registered to the Cloud API as the
+  bot's number (it can no longer be used as a normal WhatsApp account). Permanent Business System
+  User token. `WHATSAPP_APP_SECRET` for webhook signature verification. Admin notices go out as
+  interactive Approve/Decline buttons when the admin's 24-hour window is open, otherwise via the
+  approved `order_pending_confirmation` template — see §7 and §16.
+- **Admin / customer numbers**: `ADMIN_NUMBERS` (Azure app setting, digits only, no `+`) is the
+  list of admin numbers; a separate personal number is used as the test customer.
+- Menu corrected for the Boti spelling (prior session); no menu-data changes since.
 
 ---
 
-## 2. LangChain 1.0 migration (fixed)
+## 2–6. Prior session content — unchanged, not reproduced here
 
-`create_agent(model=llm, tools=tools, system_prompt=...)` from `langchain.agents`, replacing the
-old `AgentExecutor`/`create_tool_calling_agent` pattern. `run_customer_turn()`/`run_admin_turn()`
-build a `{"messages": [...]}` list from `chat_history` + the new message, and read the reply via
-`result["messages"][-1].text` (not `.content` — see §3).
-
-## 3. `.text` vs `.content` (fixed)
-
-Newer Gemini models return structured content blocks rather than a plain string. `.text` reliably
-extracts readable text regardless of format. Applied in both `run_*_turn()` functions.
+Covers: LangChain 1.0 migration, `.text` vs `.content`, the `multiple_of` pricing bug, the
+`search_menu` fuzzy-match fix, the Botti→Boti rename, the stale-total bug, the item-mislabeling
+bug, currency formatting, webhook signature verification, the agent-failure fallback reply, the
+full Gemini-latency-to-503-to-resilience-middleware saga, and the WhatsApp token lifecycle fix.
+**All still accurate and still in effect.** See the previous version of this file (same filename,
+earlier revision) if you need the detailed narrative — not repeated here to keep this update
+focused on what's new.
 
 ---
 
-## 4. Bugs found and fixed during live testing
+## 7. Admin order confirmation via WhatsApp template buttons (new this session)
 
-### 4.1 `multiple_of` pricing bug (fixed)
+### 7.1 Why this changed from the original `confirm_order`-via-chat design
 
-`add_to_cart`'s subtotal calculation used `quantity * item.price`, but for bundle items
-(Malai Boti / Grilled Boti add-ons, `multiple_of = 4`), `item.price` is priced **per portion**,
-not per piece. Ordering 4 pieces computed `4 × Rs. 450 = Rs. 1800` instead of the correct
-`1 portion × Rs. 450 = Rs. 450`. Every item with `multiple_of = 1` was unaffected, which is why
-this stayed invisible until the bundle items were specifically tested.
+The typed `confirm_order` admin tool (added in the prior session) worked, but live testing
+surfaced a structural problem: a tool-binding bug (see §7.2) meant it silently had no tools at
+all for a while, and separately, the conversational flow ("confirm it" → "which order?" →
+"let me fetch pending orders" → often stalling there, see §8) was fragile and depended on the LLM
+correctly chaining `get_pending_orders` → disambiguation → `confirm_order` in one turn.
 
-**Fix applied** in `order_tools.py`, both `add_to_cart` and `update_quantity`:
-subtotal is now `(quantity // item.multiple_of) * unit_price`. `update_quantity` also gained a
-`multiple_of` validation check it was previously missing entirely.
+**Decision**: move the primary confirm/decline path to a **Meta-approved message template** with
+tappable Approve/Decline buttons, handled **deterministically in `webhook.py` — no LLM call at
+all** for that specific action. This also solves an unrelated but real problem: Meta's 24-hour
+re-engagement window (error `131047`) was silently killing plain-text admin notices whenever the
+admin hadn't messaged the bot recently. Templates are exempt from that window.
 
-### 4.2 `search_menu` — exact substring search missed common spelling variants (fixed)
+> **Update:** the button flow below is still the design, but admin notices are now sent as
+> free-form interactive buttons when the admin's 24-hour window is open and as the template only
+> as a fallback — see §16.
 
-Customer queries like "malai boti" (single t) failed to match the DB's "Malai Botti" (double t)
-because substring matching requires an exact character match. This produced **inconsistent,
-confidently-wrong answers** ("we don't have Malai Boti") rather than a "no results" state, since
-the LLM treated an empty tool result as ground truth. The same typo pattern on "grilled boti"
-happened to succeed in one run because the model auto-corrected the spelling itself before
-calling the tool — not something to rely on.
+### 7.2 Tool-binding bug found and fixed (blocked ALL admin tools, not just confirm_order)
 
-**Fix applied**: `search_menu` now falls back to fuzzy matching (`difflib`, word-window scoring,
-threshold 0.72) when the exact substring search returns nothing. Also tightened the tool's
-docstring so the model passes only the item name, not quantities/filler words, into the query.
+In `admin_agent.py`, the `return [...]` statement meant to close `build_admin_tools` was
+misindented — it landed **inside** the `confirm_order` nested function, after that function's own
+`return`. This made it dead code, and meant `build_admin_tools` had **no return statement at
+all**, implicitly returning `None`. Every admin agent build therefore had `tools=None` — the admin
+agent had zero tools bound, for every admin interaction, until this was found. Fixed by correcting
+the indentation so the list-return belongs to `build_admin_tools`.
 
-### 4.3 Botti → Boti rename (done)
+A second bug in the same file: `from fastapi import logger` is not a working `logging.Logger` —
+it's a module. Any call to `logger.error(...)` using it would have raised `AttributeError` and
+crashed the turn instead of logging and falling back gracefully. Fixed with a proper
+`logging.getLogger(__name__)`.
 
-Renamed across `menu_items` rows (DB `UPDATE ... REPLACE`), `scripts/seed_menu.py`, and both
-`food-fusion-menu.md` and `db-schema.md`, since no customer was expected to type the double-t
-spelling. Substring search still catches "boti"; the new fuzzy fallback catches "botti" typos.
+### 7.3 Template setup
 
-### 4.4 Model stating a computed total instead of the tool's returned total (fixed)
+- **Template name**: `order_pending_confirmation`, category Utility, body:
+  `"New order #{{1}} ({{2}}) — Total: Rs. {{3}}. Please respond below."` plus two quick-reply
+  buttons (Approve / Decline). Approved by Meta.
+- `{{1}}` = order id, `{{2}}` = joined item summary (one line, no newlines — Meta templates don't
+  allow them in parameters), `{{3}}` = total.
+- Button taps arrive as `type: "button"` messages with a `payload` field
+  (`APPROVE_<id>` / `DECLINE_<id>`), distinct from normal text messages.
+- `_extract_inbound` in `webhook.py` now has a `"button"` kind; `_process_inbound` routes it to
+  `_handle_admin_button` before the text/non-text branching. `_handle_admin_button` checks
+  `user.role == admin`, parses the payload, calls `admin_tools.confirm_order` or
+  `admin_tools.reject_order` directly (plain Python, no agent invocation), sends the
+  customer-facing result message, and returns an admin-facing acknowledgment — all logged to
+  `conversation_messages` same as any other turn.
+- **`reject_order`** added to `admin_tools.py` (mirrors `confirm_order`: validates
+  `pending_confirmation` status, sets `rejected`, records `confirmed_by`) and exposed as a typed
+  fallback tool in `admin_agent.py` for admins who'd rather type than tap.
+- `format_staff_order_notice` (the old plain-text notice) is now dead code — nothing calls it
+  since `_notify_admins_of_order` switched to `send_order_confirmation_template`. Left in place,
+  harmless, candidate for deletion whenever convenient.
 
-After a cart was cleared in the DB directly (for testing), the *chat history* still contained the
-agent's own earlier "your total is Rs. 3350" message. On the next cart-modifying tool call, the
-model added the new item's price to that **remembered** number instead of using the tool's
-actual returned total — producing a total that didn't match the DB at all.
+### 7.4 Confirmed live, DB-verified
 
-**Fix applied**: strengthened `CUSTOMER_SYSTEM_PROMPT` rule 1 to explicitly forbid computing a
-total from a number mentioned earlier in the conversation; the tool's returned `total` field must
-be stated verbatim. Also a process lesson: clearing `orders` without also clearing
-`conversation_messages` leaves stale totals in context.
-
-### 4.5 Model mislabeling which item it acted on (fixed, prompt-level)
-
-During one Gemini run, the model's own confirmation text named a nonexistent item
-("Chicken Achari Masala") when removing something from the cart, and separately mislabeled a
-Grilled Boti add-on as if it were Malai Boti in a different turn. Reconciling the totals suggests
-the underlying tool calls were likely correct — the *narration* was wrong, which is arguably worse
-than a pure hallucination, since the cart could be numerically right while telling the customer
-something false about what changed.
-
-**Fix applied**: added rule 9 to `CUSTOMER_SYSTEM_PROMPT` — confirmations must use the exact item
-name as returned by the relevant tool call, never a name recalled from earlier context.
-
-### 4.6 Currency formatting inconsistency (fixed)
-
-Neither system prompt specified a price format. Different models defaulted differently — Gemini
-mostly used "Rs. X", but drifted to "X.0 PKR" in one run; the Groq/Qwen fallback test used the
-Indian Rupee symbol (₹) instead of Rupees, despite the restaurant being Pakistani.
-
-**Fix applied**: added an explicit formatting rule to both system prompts — `"Rs. <amount>"`, no
-decimals, never ₹.
-
-### 4.7 Admin number role only checked at first contact (known limitation, not yet fixed)
-
-`_get_or_create_user` only checks `ADMIN_NUMBERS` when a `User` row is first created; later edits
-to the env var don't retroactively change an existing row's `role`. Not a bug in the strict sense
-(role changes were never designed to be live), but a real gap if admin roles ever need to change
-after a number has already messaged the bot once. Current workaround: edit the `role` column
-directly in the DB. Left as-is for MVP; flag if this needs to become self-service later.
+Order #19: Roman Urdu customer order with a customization note → `submit_order` →
+`_notify_admins_of_order` sent the template (item list and note correctly visible, not a
+placeholder) → admin tapped **Approve** → customer received the real confirmation text →
+`orders.status = 'confirmed'`, `confirmed_by` set. First fully closed, DB-verified, real
+end-to-end run of the whole system.
 
 ---
 
-## 5. Webhook security & reliability (added)
+## 8. The gpt-oss-120b degenerate-output bug — a real data-corruption risk (new this session)
 
-- **Signature verification**: `receive_message` now validates Meta's `X-Hub-Signature-256` header
-  (HMAC-SHA256 over the raw body, using `WHATSAPP_APP_SECRET`) before processing anything, and
-  returns `403` on mismatch. Previously, any POST that mimicked Meta's payload shape — including
-  one spoofing an admin's phone number — would have been processed as legitimate. Live-tested
-  with a forged/unsigned request; correctly rejected.
-- **Agent-failure fallback reply**: `_process_inbound` previously let an unhandled exception from
-  `_route_message` propagate into the outer catch-all, meaning a customer got *silence* on any
-  agent-layer failure (Gemini/Groq error, tool exception, etc.) with no record and no reply. Now
-  wrapped in its own try/except with a friendly fallback ("Sorry, I hit a glitch — could you try
-  that again?"), which also gets saved to `conversation_messages` so the next turn has coherent
-  context. Confirmed live during a genuine Gemini `503` outage.
-- **Duplicate-delivery dedupe**: `already_processed()` checks `wa_message_id` before processing;
-  confirmed via direct query that no duplicate `wa_message_id` rows exist after real testing
-  under fallback-induced latency. A theoretical race (two near-simultaneous deliveries of the
-  same message both passing the check before either commits) is not fully closed — the DB's
-  `UNIQUE` constraint on `wa_message_id` would catch it at the `IntegrityError` level, but a
-  customer could still see two replies in that scenario. Not yet hardened further; not observed
-  in practice.
+### 8.1 What happened
 
----
+After the §7.2 tool-binding fix, `confirm_order` still appeared to stall on a live test — the
+agent would say "let me fetch the current pending orders" and never produce a final answer.
+Separately, while testing Roman Urdu phrasing on the customer side with `gpt-oss-120b` as primary,
+replies started coming back as hundreds of lines of repeated, garbled text
+(`"We… … …… ..."` etc.) — sometimes with a correct answer buried at the very end, sometimes not.
 
-## 6. LLM resilience — the full story (this took several rounds; read before touching model config)
+A guard was added (`looks_degenerate()` in both `customer_agent.py` and `admin_agent.py`,
+checking reply length and ellipsis-character density) to catch this before it reached WhatsApp,
+replacing it with a generic "Sorry, I couldn't process that — could you try again?" message.
 
-### 6.1 Original latency investigation (superseded — see 6.2)
+### 8.2 The real bug this exposed: the tool call had already succeeded
 
-Original theory: `langchain-google-genai` probing for Application Default Credentials over gRPC,
-hanging on Windows when no route to GCP's metadata server exists. `transport="rest"` was applied
-and initially appeared to fix it (consistent sub-5s responses).
+Closer inspection of the garbled text showed fragments like *"Added Deal 10: Chicken Tikka..."*
+buried inside the garbage — meaning `add_to_cart` had been called and had **succeeded**, and only
+the model's subsequent text generation degenerated. The generic "try again" fallback message was
+therefore actively misleading: the customer, reasonably, retried the exact same request, which
+added the item **again** for real. One test cart ended up with 4x Deal 10 from two user messages
+and two retries, confirmed via direct DB inspection.
 
-**This diagnosis was likely wrong**, or at best incomplete. `transport` turned out not to be a
-real constructor argument on the installed `langchain-google-genai` version — it silently landed
-in `model_kwargs` and was never read building the request (a known upstream issue). The apparent
-fix likely coincided with a quiet period rather than resolving anything. Root cause of the
-original intermittent slowness was never conclusively identified, but §6.2 makes it moot.
+**This is a materially worse failure mode than garbled text alone** — it's silent, repeated,
+real cart corruption, and it was specific to `gpt-oss-120b`: every reproduction (a "deal 10"
+message, and separately "eik zinger burger kr dein" with no "deal" in it) occurred immediately
+after a successful mutating tool call, in both English and Roman Urdu phrasing.
 
-### 6.2 The actual problem: Gemini capacity, not a connection bug
+### 8.3 Fixes applied
 
-Live testing surfaced a `503 UNAVAILABLE` — "model is currently experiencing high demand" — on
-`gemini-3.5-flash-lite`. This is a Google-side availability issue, unrelated to transport,
-credentials, or Windows networking. It explains both the "glitch" reply the customer received in
-that test and, retroactively, casts doubt on whether the earlier latency issue was ever a hanging
-connection rather than slow/queued responses during high demand.
+1. **Fallback behavior changed** from a generic retry prompt to a DB-grounded cart summary.
+   `_safe_cart_fallback()` in `customer_agent.py` queries the actual current cart via
+   `order_tools.get_cart_summary` and shows the customer their real state instead of inviting a
+   retry that could double an action. This stays in place regardless of which model is primary —
+   it's a correctness guard, not a model-specific patch.
+2. **Customer agent switched back to `openai/gpt-oss-20b`** as primary. Retested against both
+   trigger phrases (plain "deal 10" and "eik zinger burger kr dein") — clean on `20b`, no
+   degenerate output observed. Admin agent also switched to `20b` for consistency (not yet
+   independently stress-tested to the same depth as the customer path).
+3. **Separately found and fixed**: both `gpt-oss-20b` and `120b` misread "Deal 10" (and Deal-N
+   generally) as a request for a price *discount* rather than a menu item name, refusing with
+   "I can't apply discounts..." before ever calling `search_menu`. This is a factual gap, not a
+   behavioral one — fixed with a one-line menu-fact clarification in both system prompts (see
+   `agent-prompts.md`), not a new constraint.
 
-### 6.3 Decision: add a fallback model, not a full provider switch
+### 8.4 Open question
 
-Rather than abandoning Gemini or committing fully to Groq, added `ModelFallbackMiddleware` (from
-`langchain.agents.middleware`) so a primary-model failure (503, timeout, rate limit) automatically
-retries the same turn on a different model. New file: `app/agents/resilience.py`.
-
-### 6.4 First fallback attempt: Groq `llama-3.3-70b-versatile` — abandoned
-
-This model is deprecated on Groq (confirmed via Groq's own deprecation notices). Not used.
-
-### 6.5 Second attempt: Groq `qwen/qwen3.8-27b` — abandoned
-
-Hit a `429` rate-limit error: this is a reasoning model with hidden chain-of-thought output that
-counts against Groq's **output tokens per minute** limit, which is only **1000 OTPM** on the free
-tier for this model — far too tight for reliable use, even with short WhatsApp-length replies.
-Structural mismatch, not something worth tuning around.
-
-### 6.6 Third attempt: Groq `openai/gpt-oss-20b` — passed, adopted
-
-Chosen deliberately over `gpt-oss-120b` because of an existing finding from a separate project
-(Research & Learning Companion): `gpt-oss-120b` had documented tool-call hallucination in
-multi-step flows, a directly analogous workload to this project's search→add→disambiguate→submit
-chain. `gpt-oss-20b` was untested but avoided that specific known risk. Passed multiple live runs:
-correct ambiguity handling (listed multiple matches, asked rather than guessed), correct
-`multiple_of` portioning and pricing, correct running totals, no hallucinated items or tool calls.
-Noticeably faster than Gemini in practice, consistent with Groq's inference speed advantage.
-
-### 6.7 Gemini's own failure, live — the case for the final swap
-
-With Gemini still primary at the time, a live customer-flow test surfaced **two hard-rule
-violations in a single conversation**: it silently picked one of two ambiguous matches instead of
-asking (violating the core "never guess" rule), and it fabricated that an item didn't exist
-despite finding it moments later in the same conversation (violating "never state from memory").
-A separate run also produced the item-mislabeling bug in §4.5. This, combined with `gpt-oss-20b`'s
-clean results, motivated flipping the assignment.
-
-### 6.8 Final configuration: Groq primary, Gemini fallback
-
-- **Primary**: `openai/gpt-oss-20b` on Groq (both `customer_agent.py` and `admin_agent.py`).
-- **Fallback**: Gemini `gemini-3.5-flash-lite` (not full `gemini-3.5-flash` — that model's free
-  tier is only 5 RPM, which was exhausted almost immediately during a forced-fallback test that
-  triggered multiple Gemini calls per turn; `flash-lite`'s 15 RPM gives real headroom). Accepting
-  `flash-lite`'s earlier-observed weaknesses as an acceptable tradeoff *specifically because* it's
-  now a rarely-invoked fallback rather than the model handling every customer interaction.
-- Both `get_customer_llm()`/`get_admin_llm()` now use `timeout=20, max_retries=1` — no
-  `transport` argument (removed, was a no-op), no `temperature` on the Groq models (Gemini 3.5
-  models also ignore it and warn).
-
-### 6.9 A note on reading fallback logs
-
-`ModelFallbackMiddleware` wraps **each individual LLM call**, not each customer message. A single
-WhatsApp message that requires several ReAct steps (search → evaluate → add → compose reply) will
-produce that many separate primary-fail/fallback-success pairs in the logs if the primary is down
-— this looks like "flip-flopping" but is expected, correct behavior. Also: there is currently no
-cooldown/circuit-breaker — every new message re-attempts the primary model first even during a
-known outage, since each webhook call builds a fresh agent with no memory of prior failures.
-Acceptable for now; worth revisiting if Groq/Gemini outages become frequent enough that the
-wasted latency per message starts to matter.
+Why `120b` degenerates specifically after a successful tool call is not understood — no root
+cause identified, only the trigger pattern (post-tool-call text generation) and the practical fix
+(don't use `120b` as primary; ground the fallback in real DB state regardless of model). Not worth
+further investigation unless `120b` becomes necessary again for some other reason.
 
 ---
 
-## 7. WhatsApp token lifecycle (resolved)
+## 9. Windows Smart App Control blocked psycopg2's DLL (new this session, unrelated to the above)
 
-Hit repeated `401`/token-expired errors during testing — sometimes well under the expected ~24h
-window, traced to using a Graph API Explorer token (≈1h default lifespan) rather than the
-WhatsApp app's own API Setup page token. Resolved by creating a **Business System User** in Meta
-Business Settings, assigning the WhatsApp app to it, and generating a token with
-`whatsapp_business_messaging` scope — this does not expire on the same rolling basis and has
-removed this class of interruption from testing.
+`uvicorn` startup began failing with `ImportError: DLL load failed... An Application Control
+policy has blocked this file`, pointing at a `delvewheel`-vendored `libcrypto` DLL inside
+`psycopg2-binary`. Windows Smart App Control blocked it as untrusted — same class of issue
+previously hit with Jupyter Lab, but this time not avoidable via a launch-method change (`python
+-m uvicorn` did not help; the block is on the DLL itself, not the launcher).
 
----
-
-## 8. Admin order confirmation (added, ahead of original roadmap)
-
-`db-schema.md` originally deferred order confirmation to a manual DB edit outside the bot
-entirely (Phase 2 territory). Live-testing the admin flow surfaced this as a real gap once seen
-in an actual chat — "confirm it" had no tool to call and the agent correctly (per spec) refused.
-
-**Added `confirm_order(order_id, ready_in_minutes=0)`** as a new admin tool: validates the order
-is `pending_confirmation`, sets it to `confirmed`, and sends the customer a WhatsApp confirmation
-message directly (written by application code, not the LLM — keeps "LLM interprets, application
-decides" intact). `ADMIN_SYSTEM_PROMPT` updated to require calling `get_pending_orders` first to
-identify the order (never guessing a number) and confirming before executing, same pattern as
-other admin writes. This can be removed/reverted to the original manual-DB-edit design later if
-desired — it was a deliberate scope pull-forward, not a spec change forced by a bug.
+**Fix**: switched the Postgres driver from `psycopg2` to **`pg8000`**, a pure-Python driver with
+no compiled extensions — nothing for SAC to block. Required two changes:
+- `DATABASE_URL` driver prefix: `postgresql+psycopg2://` → `postgresql+pg8000://`, and the
+  `?sslmode=require` query parameter removed (not a `pg8000`-recognized parameter).
+- `database.py`: SSL now configured via an explicit `ssl.SSLContext` passed through
+  `connect_args={"ssl_context": ...}`, since `pg8000` doesn't use `sslmode`. First attempt used
+  `ssl.create_default_context()` (full certificate verification), which failed against Supabase's
+  pooler with `CERTIFICATE_VERIFY_FAILED: self-signed certificate in certificate chain`. Resolved
+  by explicitly setting `check_hostname = False` and `verify_mode = ssl.CERT_NONE` — this matches
+  (not weakens) the security posture `psycopg2`'s `sslmode=require` already had: encrypted
+  transport, no certificate chain validation. **Known residual gap, not new**: no protection
+  against a MITM on the DB connection path; Supabase does publish a CA cert that could be loaded
+  via `load_verify_locations()` for proper verification later, deferred as non-urgent since it's
+  the same risk level as what shipped before this switch, not a regression.
 
 ---
 
-## 9. Multi-turn / live conversation testing — results
+## 10. Order-line customization notes (new this session)
 
-All tested live via the real webhook + WhatsApp, not just in a Python shell:
+Live testing surfaced a real request a customer actually made ("leg piece instead of breast" on a
+Deal 10) that the system had no way to handle — `db-schema.md`'s `order_items.note` column existed
+from the original design but was never wired into any tool.
 
-- ✅ Webhook signature rejection (forged/unsigned request → `403`, nothing processed)
-- ✅ Duplicate-message dedupe (no duplicate `wa_message_id` rows after testing under load)
-- ✅ Customer ambiguity handling — multiple menu matches → asks, doesn't guess (on `gpt-oss-20b`;
-  failed on Gemini in one run, see §4.5/§6.7)
-- ✅ `multiple_of` enforcement and correct bundle pricing (post-fix)
+**Added**: `note: str | None` parameter threaded through `order_tools.add_to_cart` →
+`customer_agent.py`'s `add_to_cart` tool → surfaced in `get_cart_summary`'s returned line dicts →
+surfaced in `admin_agent.py`'s `get_pending_orders` → surfaced in `webhook.py`'s
+`_notify_admins_of_order` template parameter construction. A note is purely descriptive — **it
+does not change pricing**, consistent with the original "deals are flat-priced, don't decompose
+components" design principle. Confirmed live: a leg-piece request was correctly captured, visible
+in the admin's template notice (not silently dropped), and visible via the typed
+`get_pending_orders` path too.
+
+---
+
+## 11. Prompt rules added this session
+
+Two new hard rules, mirrored across `CUSTOMER_SYSTEM_PROMPT` and `ADMIN_SYSTEM_PROMPT`:
+
+- **"Deal" items are regular menu items, not discount requests** — see §8.3 point 3. A factual
+  clarification about the menu, not a behavioral constraint.
+- **Reply in Roman Urdu/Urdu when the customer/admin writes in it** — followed inconsistently in
+  practice (confirmed via logs: Gemini followed it correctly on a fallback turn triggered by two
+  consecutive Groq `400 Bad Request` errors; whether `gpt-oss-20b` follows it as reliably across
+  multiple consecutive turns is not yet cleanly isolated). Accepted as-is since both languages are
+  mutually understood by real users — not worth further prompt engineering unless it starts
+  causing genuine confusion rather than stylistic drift.
+
+---
+
+## 12. New, unexplained: Groq `400 Bad Request`
+
+Observed twice consecutively in one log capture, immediately triggering the Gemini fallback (which
+then succeeded). Response body was not captured/logged at the time, so the actual cause is
+unknown — distinct from the previously-diagnosed `429` (rate limit) and `503` (capacity) failure
+modes. If this recurs, capture and log the response body (similar to how `WhatsApp send failed`
+already logs `response.text`) before assuming it's the same root cause as past Groq issues.
+
+---
+
+## 13. Live testing — cumulative results
+
+All tested through the real webhook and real WhatsApp, not just a Python shell:
+
+- ✅ Webhook signature rejection, duplicate-message dedupe, customer ambiguity handling
+- ✅ `multiple_of` enforcement and correct bundle pricing
 - ✅ Deal component removal ("no raita") does not change price
-- ✅ Admin mark-item-unavailable → confirm → customer correctly blocked from ordering that item
-- ✅ Forced Groq→Gemini fallback under real conditions (primary deliberately broken)
-- ✅ Roman Urdu input ("Eik deal 10 kr dein") correctly understood with no special handling needed
-- ⚠️ Not yet done: full soak test of submit_order → admin confirm_order → customer notification,
-  chained together in one live run
-- ⚠️ Not yet done: deliberate stress test of the duplicate-delivery race window under genuinely
-  concurrent (not just fallback-slowed) requests
+- ✅ Admin mark-item-unavailable → customer correctly blocked from ordering that item
+- ✅ Forced Groq→Gemini fallback under real conditions
+- ✅ Roman Urdu input, including an added item and a correctly applied order note
+- ✅ Approve button → `confirm_order` fires, customer notified, DB shows `confirmed`
+- ✅ Full loop running on **Azure** (not ngrok) with the original test number
+- ✅ Full loop on the **real registered number in Live mode**, customer on a separate phone
+- ✅ Interactive Approve/Decline buttons (free-form, no template) render for the admin and the tap
+  is parsed and routed correctly (§16)
+- ⚠️ Decline button path: implemented, not yet explicitly tested live
+- ⚠️ Template fallback (admin window closed): cannot succeed until a WABA payment method is added
+- ⚠️ Non-text message fallback (image/voice) re-check after the §18 indentation fix
+- ⚠️ Admin agent on `gpt-oss-20b` not stress-tested as deeply as the customer agent
+- ⚠️ Groq `400 Bad Request` still undiagnosed (seen again on Azure)
+- ⚠️ Duplicate-webhook-delivery race window still theoretical, never observed
 
 ---
 
-## 10. Open items
+## 14. Azure deployment (summary — full narrative in `deployment-notes.md`)
 
-- Full end-to-end soak test: customer builds and submits an order → admin receives notice →
-  admin runs `confirm_order` → customer receives the confirmation message — as one continuous
-  live run rather than pieces tested separately.
-- Decide whether the duplicate-delivery race window (§5) needs hardening beyond the DB unique
-  constraint, or is acceptable as-is for current volume.
-- Decide whether to add a Groq-outage cooldown/circuit-breaker (§6.9) if fallback frequency
-  increases.
-- DB-backed conversation history is implemented (`conversation_messages`, last 16 turns loaded
-  per user) — no longer an open item, but worth revisiting the 16-turn window if longer
-  conversations start losing useful context.
-- Drinks modeled as one row per size across all brands ("Coke/Pepsi/etc.") rather than per-brand
-  — a known, deliberate tradeoff (see `agent-prompts.md` discussion); splitting into real
-  per-brand rows is pure data work, deferred until there's another reason to touch the menu data.
-- `admin_number_set` is only checked at first contact per number (§4.7) — fine for MVP, revisit
-  if admin roles need to change after first contact becomes routine.
+Resources: resource group `food-fusion-rg`, Linux App Service plan `food-fusion-plan` (B1), Web App
+`food-fusion-bot`, all in **Central US**. Startup command:
+`uvicorn app.main:app --host 0.0.0.0 --port 8000`. Env vars set as App Service settings.
+`requirements.txt` was regenerated with exact pinned versions (it still listed `psycopg2-binary`
+and old LangChain constraints and omitted `langchain-groq`) and verified in a clean venv.
+
+Obstacles worth remembering: a Free Trial subscription has zero compute quota and cannot request
+more (upgrade to Pay-As-You-Go); UAE North and East US still showed 0 quota while Central US worked;
+the GitHub deploy failed with "publish profile invalid" until the profile was re-downloaded from the
+portal instead of copied out of a terminal. Details and commands are in `deployment-notes.md`.
+
+---
+
+## 15. Going live on Meta
+
+- App switched from Development to **Live mode**. A privacy policy page is required first; it is
+  served from the app itself at `/privacy-policy` (a static HTML route in `main.py`).
+- **Business Verification and App Review were deliberately skipped.** For a single business using
+  its own app and WABA they are not required to message real customers; the only consequence is
+  the cap of 250 unique customer conversations per rolling 24 hours, accepted for now. Revisit when
+  volume approaches that.
+- A dedicated number was registered to the Cloud API. Once registered, a number cannot be used as
+  a normal WhatsApp account (no phone app, no chat history on the handset) — everything goes
+  through the API. The Phone Number ID (not the number itself) goes into
+  `WHATSAPP_PHONE_NUMBER_ID`.
+- The template was recreated under the new WABA with a **fourth body parameter, the customer's
+  number**, so staff can call the customer: `New order #{{1}} ({{2}}) — Total: Rs. {{3}}.
+  Customer: {{4}}. Please respond below.` plus the two quick-reply buttons.
+- The `RAW PAYLOAD` debug logging was removed from `webhook.py`; it logged customer names and
+  numbers, which conflicts with the published privacy policy. Delivery-status logging stays.
+
+---
+
+## 16. WhatsApp billing and the admin notice (read before changing notification code)
+
+**What happened.** The first admin template sent from the new WABA failed asynchronously with
+`131042` ("business eligibility payment issue") — first because no billing currency was configured,
+then, after the currency was set, because no payment method was attached. The send API still
+returned 200; the failure only appears in the status webhook, which is why status logging matters.
+The card used for Azure was not accepted by Meta's billing.
+
+**Pricing context (third-party summaries, verify against Meta's rate card).** Since 1 Oct 2026,
+utility templates are charged even inside an open customer-service window, and free-form replies get
+the first 1,000 delivered messages per business number per month free, then are charged at the
+utility rate. Rates quoted were fractions of a cent to about a cent per message; the exact Pakistan
+rate was not confirmed. More admins means more template messages per order.
+
+**Decision: hybrid notification.** `_notify_admins_of_order` now checks, per admin, whether the admin
+has messaged the bot in the last 23 hours (`_admin_window_open`, reading the admin's latest
+user-role row in `conversation_messages`). If so it sends a free-form **interactive reply-button
+message** (`send_order_interactive`, same Approve/Decline buttons, no template); otherwise it falls
+back to the template (`send_order_confirmation_template`). Button taps and any admin message renew
+the window, so in normal use the template is only needed after a long quiet gap.
+
+**Caveats.**
+- If the window is closed and no payment method is attached, the template fallback fails. Practical
+  mitigation: the admin sends any message to the bot at the start of the day.
+- The window check reads **our** database, not Meta's state. Wiping `conversation_messages` during
+  testing makes the app think the window is closed even when Meta's is still open, which sends the
+  template and triggers `131042`. After any wipe, send a message from the admin number first.
+- The customer replies share the same 1,000/month free allowance, so billing will be needed at
+  volume regardless.
+- Taps on interactive buttons arrive as `type: "interactive"` (`button_reply.id`), not
+  `type: "button"` (template quick replies, `button.payload`). `_extract_inbound` handles both and
+  both map to the same `kind: "button"` handler.
+
+---
+
+## 17. Admin role not re-checked after first contact (hit again; fix recommended)
+
+A number that had been used as a customer was later added to `ADMIN_NUMBERS`, but its existing
+`users` row stayed `customer`, so the bot greeted it as a customer and the Approve tap returned
+"You're not authorized to do that." (the role check working correctly on stale data). Clearing the
+`users` table fixed the instance. **Recommended code fix:** have `_get_or_create_user` compute the
+expected role from `ADMIN_NUMBERS` on every message and update the row if it differs, making
+`ADMIN_NUMBERS` the single source of truth (this also demotes numbers removed from the list, and
+overrides any manual role edit in the DB). **Verify this is in the repo** — see open items.
+
+---
+
+## 18. Inbound parsing bug caught in review
+
+When the `interactive` branch was added to `_extract_inbound`, an `if reply:` line was dedented
+outside the branch. It would not raise an `IndentationError`, but any message type other than
+`interactive` (image, voice note, location, sticker) that reached it would raise
+`UnboundLocalError`, which the surrounding `except (KeyError, IndexError, TypeError)` does not
+catch — a 500 from the webhook and Meta retries. Fix: indent `if reply:` and its return inside the
+`interactive` branch. **Verify in the repo.**
+
+---
+
+## 19. Open items
+
+- Attach a payment method to the WhatsApp Business Account (needed for the template fallback and
+  for volume beyond the free allowance).
+- Verify in the repo: role sync in `_get_or_create_user` (§17) and the `if reply:` indentation
+  fix (§18); then re-test an image message from the customer number.
+- Azure hardening: turn on **Always On** (it was `false` at creation; an idle app can unload and
+  cold-start slowly on the next webhook), set **HTTPS Only**, add a health-check path, and create a
+  cost budget alert.
+- GitHub Actions authentication: move from the publish-profile secret to OIDC federation with a
+  service principal (no stored secret) — the "proper way", deliberately deferred.
+- Decline-button live test; stress-test the admin agent on `gpt-oss-20b`.
+- Capture the Groq `400` response body to diagnose it instead of only falling back.
+- Business Verification when approaching the 250-conversation cap.
+- Decide whether to harden the duplicate-webhook race (still theoretical).
+- Clean-ups: delete dead `format_staff_order_notice`; load the Supabase CA certificate to replace
+  `CERT_NONE`; optionally truncate only the items list (not the whole body) in
+  `send_order_interactive` so the customer line is never cut off.
 
 ---
 
 ## Companion files
 
-- `project-spec.md` — problem statement, architecture, roadmap
-- `db-schema.md` — database schema (includes `conversation_messages`, Boti rename note)
+- `project-spec.md` — problem statement, architecture, roadmap (updated to reflect deployment)
+- `db-schema.md` — database schema
 - `food-fusion-menu.md` — menu content
-- `agent-prompts.md` — system prompts and tool specs (updated: currency rule, exact-name rule,
-  admin order-confirmation intent)
+- `agent-prompts.md` — system prompts and tool specs
+- `deployment-notes.md` — Azure + Meta go-live narrative, concepts learned, troubleshooting table
 - `continuation-prompt.md` — handoff prompt for a new session
