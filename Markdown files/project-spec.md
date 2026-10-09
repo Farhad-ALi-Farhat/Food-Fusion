@@ -159,7 +159,8 @@ Inventory management, stock quantities, order history, customer loyalty, automat
 | Meta WhatsApp Cloud API | Message transport in/out |
 | FastAPI webhook | Receives messages, identifies sender, routes to customer/admin flow |
 | Router / guardrails | Filters input, decides hardcoded vs. LLM path, enforces business boundary |
-| LangChain + LLM (Groq or Gemini, swappable) | Natural-language understanding → structured tool calls; never touches the DB directly |
+| LangChain + LLM (Groq `gpt-oss-20b` primary, Gemini fallback) | Natural-language understanding → structured tool calls; never touches the DB directly. Originally Gemini-only; changed after live testing (see `implementation-log.md` §6, §8). |
+| Azure App Service | Hosts the FastAPI app (Linux, B1) with a stable HTTPS URL; deployed from GitHub via Actions (see `deployment-notes.md`) |
 | Tool functions (backend) | Deterministic logic: pricing, availability checks, cart math, order state transitions, admin writes |
 | PostgreSQL | Source of truth for menu, orders, overrides, users |
 
@@ -191,23 +192,39 @@ Tracked per phone number in the DB (not just in memory), so context survives acr
 
 ## 4. Roadmap / Implementation Phases
 
-### Phase 0 — Design (current phase)
+### Phase 0 — Design (complete)
 - [x] Problem statement and architecture (this document)
 - [x] Menu extraction and pricing decisions (`food-fusion-menu.md`)
-- [ ] Finalize DB schema (tables + columns, order state enum)
-- [ ] Write the customer-agent system prompt / tool-calling spec
-- [ ] Define admin command list and confirmation wording
+- [x] Finalize DB schema (tables + columns, order state enum) — `db-schema.md`
+- [x] Write the customer-agent system prompt / tool-calling spec — `agent-prompts.md`
+- [x] Define admin command list and confirmation wording — `agent-prompts.md`
 
-### Phase 1 — MVP
-- WhatsApp webhook → FastAPI → LangChain → tools → PostgreSQL, end to end
-- Customer: greeting, restaurant info, view menu, ask about items/prices/availability, get recommendations, build/modify/review order, submit order, receive "awaiting confirmation" message
-- Restaurant: receive pending orders as plain WhatsApp messages; confirm/reject manually (no dashboard yet)
-- Admin: mark items unavailable/available, add a daily special — via the same WhatsApp number
+### Phase 1 — MVP (complete; deployed and live)
+- WhatsApp webhook → FastAPI → LangChain → tools → PostgreSQL, end to end — **done, running on Azure**
+- Customer: greeting, restaurant info, view menu, ask about items/prices/availability, get recommendations, build/modify/review order, submit order, receive "awaiting confirmation" message — **done** (English and Roman Urdu; per-line customization notes added)
+- Restaurant: receives each pending order as an **Approve / Decline** button message on WhatsApp and confirms or rejects with one tap; the customer is notified automatically — **done** (this pulled forward part of what was planned for the Phase 2 dashboard)
+- Admin: mark items unavailable/available, add a daily special, check pending orders, confirm/decline by typing — **done**, via the same WhatsApp number
+
+Progress:
+- [x] FastAPI project scaffold — models, tools, agents, webhook router
+- [x] LLM: Groq `gpt-oss-20b` primary with Gemini fallback (changed from Gemini-only after live testing)
+- [x] Menu seed script (`scripts/seed_menu.py`) — all items from `food-fusion-menu.md`
+- [x] Real WhatsApp send, webhook signature verification, delivery-status logging
+- [x] DB-backed conversation history (`conversation_messages`)
+- [x] End-to-end tests against live Postgres, real LLMs and real WhatsApp
+- [x] Deployed to Azure App Service with GitHub Actions CI/CD
+- [x] Meta app in Live mode on a dedicated number (Business Verification deliberately deferred)
+
+Still to do before wider launch:
+- [ ] Add a payment method to the WhatsApp Business Account (template fallback is blocked without it)
+- [ ] Azure hardening: Always On, HTTPS Only, health check, budget alert; GitHub Actions via OIDC instead of a publish-profile secret
+- [ ] Business Verification when nearing the 250-unique-conversations/24h cap
+- [ ] Remaining items in `implementation-log.md` §19
 
 ### Phase 2
 - Customer profiles, order history
 - Structured deals/specials management
-- Restaurant dashboard (web) for viewing/confirming pending orders instead of relying on chat alone
+- Restaurant dashboard (web) for viewing orders and history (basic confirm/decline already works via WhatsApp buttons)
 - Order status notifications
 - Better conversation memory
 
@@ -223,3 +240,7 @@ Tracked per phone number in the DB (not just in memory), so context survives acr
 ## 5. Companion files
 
 - `food-fusion-menu.md` — full extracted menu with prices, categories, and modeling notes; maps directly onto `menu_items`.
+- `db-schema.md` — the PostgreSQL schema built from this document.
+- `agent-prompts.md` — customer/admin system prompts and tool specs.
+- `deployment-notes.md` — how the app was deployed to Azure and taken live on WhatsApp: concepts, commands, troubleshooting table, hardening checklist.
+- `implementation-log.md` — what's actually been built, fixed, and tested since these design docs were finalized (LangChain 1.0 migration, Gemini model notes, latency investigation, test results). Read this before assuming something described as "not yet started" here still is.
